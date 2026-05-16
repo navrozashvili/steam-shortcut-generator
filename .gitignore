@@ -5,3 +5,5 @@ settings.json
 .python-version
 steam_shortcut_generator.egg-info
 error_log.txt
+.steamcmd
+.vs

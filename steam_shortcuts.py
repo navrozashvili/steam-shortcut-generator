@@ -7,24 +7,33 @@
 # ]
 # exclude-newer = "2025-06-14T00:00:00Z"
 # ///
-import json
+import io
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 import traceback
-from typing import List, Tuple
+import zipfile
 import winreg
 from os import path
 
 import urllib3
 import vdf
-from PIL import Image
+from PIL import Image, ImageOps
 
-STEAM_API = "http://api.steampowered.com/"
-KEY = "20F58DAB4E215359D7667DB18C99BD8D"
-games_endpoint = f"{STEAM_API}IPlayerService/GetOwnedGames/v0001/?key={KEY}&format=json&include_appinfo=true&include_played_free_games=true&steamid="
-id_endpoint = f"{STEAM_API}ISteamUser/ResolveVanityURL/v0001/?key={KEY}&vanityurl="
 http = urllib3.PoolManager()
+ICON_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+STEAM_COMMUNITY_ICON_URLS = (
+    "https://shared.fastly.steamstatic.com/community_assets/images/apps/{appid}/{icon_hash}.ico",
+    "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/{appid}/{icon_hash}.ico",
+    "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/{appid}/{icon_hash}.jpg",
+    "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/{appid}/{icon_hash}.png",
+    "https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{appid}/{icon_hash}.ico",
+    "https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{appid}/{icon_hash}.jpg",
+    "https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{appid}/{icon_hash}.png",
+)
+STEAMCMD_ZIP_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
 
 
 def main():
@@ -32,52 +41,51 @@ def main():
     Where the magic happens
     """
 
+    force_refresh = "--force-refresh" in sys.argv or "--force" in sys.argv
+
     # Get path to Steam and libraries
     steam_path = get_steam_path()
     library_path = get_steam_library_path(steam_path)
     libraries = get_library_folders(steam_path, library_path)
-    local_users = get_steam_local_user_ids(steam_path)
 
     if not libraries:
         print("No libraries to check")
         sys.exit(0)
 
-    icons = get_steam_game_icons(local_users)
-
     # Show game and folder info to user
-    games = get_installed_games(libraries, icons)
+    games = get_installed_games(libraries)
     print(
         f"Found {len(games)} game{'s' if len(games) > 1 else ''} in the following libraries:"
     )
     print("\n".join(map(lambda x: f"  {x}", libraries)))
 
-    games_without_icon_hashes = [
-        "  " + game["name"] for game in games.values() if game["icon_hash"] is None
-    ]
-
-    if games_without_icon_hashes:
-        print(
-            f"\nFound installed games ({len(games_without_icon_hashes)}) which don't belong to your account."
-        )
-        print("\n".join(games_without_icon_hashes))
-        print(
-            "Shortcuts for these games can still be created, but they will not have icons."
-        )
-
     # Try and find any existing icons for the found games
     check_for_icons(games)
     found_icons = len([True for game in games.values() if game["icon"]])
     print(f"\nFound {found_icons} existing game icon{'s' if found_icons != 1 else ''}")
+
+    if found_icons > 0:
+        refresh_icons = force_refresh or (
+            input("Refresh existing generated icons? y/[N] ").lower().strip() == "y"
+        )
+        if refresh_icons:
+            removed_icons = clear_existing_icons(games)
+            found_icons = len([True for game in games.values() if game["icon"]])
+            print(
+                f"Removed {removed_icons} generated icon{'s' if removed_icons != 1 else ''}"
+            )
+
     # Ask the user if they'd like to download the missing icons
     # By default will download missing icons and create shortcuts with missing icons
     create_with_missing, try_download, start_menu = True, True, False
     missing = len(games) - found_icons
     if missing > 0:
         print(f"\nMissing icons for {missing} game{'s' if missing != 1 else ''}")
-        try_download = input("Try to download them now? [Y]/n ").lower().strip() != "n"
+        if not force_refresh:
+            try_download = input("Try to download them now? [Y]/n ").lower().strip() != "n"
 
     if try_download:
-        get_icons(games)
+        get_icons(games, steam_path)
 
     # Check for any icons that are still missing
     failed = [game["name"] for game in games.values() if not game["icon"]]
@@ -116,111 +124,6 @@ def main():
     )
 
 
-def is_integer(x):
-    try:
-        int(x)
-        return True
-    except ValueError:
-        return False
-
-
-def get_steam_game_icons(local_users: List[Tuple[str, str]]):
-    games_endpoint = f"{STEAM_API}IPlayerService/GetOwnedGames/v0001/?key={KEY}&format=json&include_appinfo=true&include_played_free_games=true&steamid="
-    print("""This tool needs to know your Steam ID (long number).""")
-
-    username, steam_id = determine_username_id(local_users)
-
-    resolve_id = http.request("GET", games_endpoint + steam_id)
-    body = json.loads(resolve_id.data.decode("utf-8"))
-    if resolve_id.status != 200:
-        print(f"Provided or resolved ID not working: {steam_id}")
-        print("Please check ID manually & report on GitHub if the issue persists.")
-    elif len(body["response"]) == 0:
-        print(f"\nEmpty response from SteamAPI")
-        print(f"{steam_id}'s game library is not publicly visible")
-        with open("error_log.txt", "a", encoding="utf-8") as f:
-            f.write(f"Empty response from SteamAPI for user {username} ({steam_id}):\n")
-            f.write(json.dumps(body))
-
-        sys.exit(-1)
-
-    appid_to_icon = {
-        str(game["appid"]): f"{game['img_icon_url']}.jpg"
-        for game in body["response"]["games"]
-    }
-
-    return appid_to_icon
-
-
-def determine_username_id(local_users: List[Tuple[str, str]]):
-    username, steam_id = None, None
-
-    if local_users:
-        while True:
-            options = "\n".join(
-                f"{i+1}) {u[0]} ({u[1]})" for i, u in enumerate(local_users)
-            )
-            idx = input(
-                "\nFound local users, enter a choice and press Enter:\n"
-                + options
-                + "\nX) Enter username manually...\nChoice: "
-            )
-            print()
-            if idx.lower() == "x":
-                break
-            try:
-                choice = int(idx)
-                if choice > 0 and choice <= len(local_users):
-                    username, steam_id = local_users[choice - 1]
-                    break
-            except ValueError:
-                print("Invalid input: " + idx)
-
-    if username is None or steam_id is None:
-        username = input(
-            "\nPlease enter your Steam ID, username (not nickname), or custom profile id: "
-        )
-
-        steam_id = resolve_steam_id_from_username(username)
-
-        if steam_id is None:
-            if is_integer(username):
-                print("\nIt looks like you entered an invalid Steam ID")
-            else:
-                print("\nCould not retrieve SteamID from username: " + username)
-
-            print("Please double check your details and try again.")
-            print("If this issue persists, please report it on github!")
-            sys.exit(-1)
-    return username, steam_id
-
-
-def resolve_steam_id_from_username(username):
-    """
-    Tries to resolve ID from username using ResolveVanityURL. On failure, see
-    if the username provided was actually an ID already. On failure, return None.
-    """
-
-    # Assume username is not an ID
-    resolve_id = http.request("GET", id_endpoint + username)
-    body = json.loads(resolve_id.data.decode("utf-8"))
-    steam_id = None
-    if body["response"]["success"] == 1:
-        steam_id = body["response"]["steamid"]
-        print("Found ID from username: " + steam_id)
-        return steam_id
-    elif is_integer(username):
-        # See if username is an ID
-        resolve_id = http.request("GET", games_endpoint + username)
-        body = json.loads(resolve_id.data.decode("utf-8"))
-        print(resolve_id.status)
-        print(len(body["response"]))
-        if resolve_id.status == 200 and len(body["response"]) > 0:
-            return username
-
-    return None
-
-
 def get_steam_library_path(steam_path: pathlib.Path) -> pathlib.Path:
     # Try and get the library index file as a sanity check for the right folder
     try:
@@ -230,28 +133,6 @@ def get_steam_library_path(steam_path: pathlib.Path) -> pathlib.Path:
     except IndexError:
         print("Could not locate local library.")
         sys.exit(-1)
-
-
-def get_steam_local_user_ids(steam_path: pathlib.Path) -> List[Tuple[str, str]]:
-    # Try and get the library index file as a sanity check for the right folder
-    users = []
-    try:
-        login_file = list(steam_path.glob("config/loginusers.vdf"))
-        if not login_file:
-            return []
-
-        with open(login_file[0]) as index_file:
-            lib_vdf = vdf.load(index_file)
-
-            for id_, data in lib_vdf.get("users", {}).items():
-                if isinstance(data, dict) and data.get("AccountName"):
-                    users.append((data["AccountName"], id_))
-
-    except Exception:
-        print("Could not locate local users.")
-    finally:
-        return users
-
 
 def get_steam_path():
     """
@@ -263,19 +144,20 @@ def get_steam_path():
     """
 
     # Search Registry
+    hkey = None
     try:
         hkey = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam"
         )
     except OSError:
-        hkey = None
         print(sys.exc_info())
-    try:
-        steam_path = winreg.QueryValueEx(hkey, "InstallPath")[0]
-    except OSError:
-        steam_path = None
-        print(sys.exc_info())
-    winreg.CloseKey(hkey)
+    steam_path = None
+    if hkey:
+        try:
+            steam_path = winreg.QueryValueEx(hkey, "InstallPath")[0]
+        except OSError:
+            print(sys.exc_info())
+        winreg.CloseKey(hkey)
 
     # Ask the user if the registry was unhelpful
     if not steam_path:
@@ -310,12 +192,12 @@ def get_library_folders(steam_path, library_index_path):
     return sorted(pathlib.Path(library_path) for library_path in paths)
 
 
-def get_installed_games(libraries, icons):
+def get_installed_games(libraries):
     """
     For each library, parse all the appmanifest_xxx.acf files for
     game names and install locations, where xxx is the appid of an installed game.
 
-    Returns a dictionary of appid -> {name, location, icon, icon_hash, icon_ext}
+    Returns a dictionary of appid -> {name, location, icon, icon_hash}
     """
 
     # Horrible flattening of each manifest file
@@ -355,12 +237,7 @@ def get_installed_games(libraries, icons):
                         "name": name,
                         "location": location,
                         "icon": None,
-                        "icon_hash": icons[appid].split(".")[0]
-                        if appid in icons.keys()
-                        else None,
-                        "icon_ext": icons[appid].split(".")[1]
-                        if appid in icons.keys()
-                        else None,
+                        "icon_hash": None,
                     }
                 else:
                     print(
@@ -375,49 +252,229 @@ def get_installed_games(libraries, icons):
     return games
 
 
+def is_icon_hash(value):
+    return bool(re.fullmatch(r"[0-9a-fA-F]{40}", value or ""))
+
+
+def find_steamcmd(steam_path):
+    script_steamcmd = pathlib.Path(__file__).resolve().parent / ".steamcmd" / "steamcmd.exe"
+    candidates = [
+        shutil.which("steamcmd"),
+        shutil.which("steamcmd.exe"),
+        steam_path / "steamcmd.exe",
+        pathlib.Path("steamcmd.exe"),
+        script_steamcmd,
+    ]
+
+    for candidate in candidates:
+        if candidate and pathlib.Path(candidate).exists():
+            return str(candidate)
+
+    return None
+
+
+def download_steamcmd():
+    steamcmd_path = pathlib.Path(__file__).resolve().parent / ".steamcmd" / "steamcmd.exe"
+    if steamcmd_path.exists():
+        return str(steamcmd_path)
+
+    print("    Downloading SteamCMD to fetch Steam icon metadata...")
+    try:
+        response = http.request(
+            "GET",
+            STEAMCMD_ZIP_URL,
+            timeout=urllib3.Timeout(connect=10, read=60),
+        )
+    except Exception:
+        return None
+
+    if response.status != 200:
+        return None
+
+    try:
+        steamcmd_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(response.data)) as steamcmd_zip:
+            with steamcmd_zip.open("steamcmd.exe") as source, open(
+                steamcmd_path, "wb"
+            ) as destination:
+                shutil.copyfileobj(source, destination)
+    except Exception:
+        return None
+
+    return str(steamcmd_path) if steamcmd_path.exists() else None
+
+
+def parse_steamcmd_clienticon_hashes(output, appids):
+    hashes = {}
+    for appid in appids:
+        match = re.search(
+            rf'"{re.escape(str(appid))}"\s*\{{.*?"clienticon"\s+"([0-9a-fA-F]{{40}})"',
+            output,
+            re.DOTALL,
+        )
+        if match:
+            hashes[str(appid)] = match.group(1)
+
+    if len(appids) == 1 and not hashes:
+        match = re.search(r'"clienticon"\s+"([0-9a-fA-F]{40})"', output)
+        if match:
+            hashes[str(appids[0])] = match.group(1)
+
+    return hashes
+
+
+def steamcmd_clienticon_hashes(appids, steam_path):
+    appids = [str(appid) for appid in appids]
+    if not appids:
+        return {}
+
+    steamcmd = find_steamcmd(steam_path) or download_steamcmd()
+    if steamcmd is None:
+        return {}
+
+    print(f"    Fetching clienticon hashes from SteamCMD for {len(appids)} app(s)...")
+    command = [
+        steamcmd,
+        "+login",
+        "anonymous",
+        "+app_info_update",
+        "1",
+    ]
+    for appid in appids:
+        command.extend(["+app_info_print", appid])
+    command.append("+quit")
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+    except Exception:
+        return {}
+
+    output = result.stdout + result.stderr
+    return parse_steamcmd_clienticon_hashes(output, appids)
+
+
 def check_for_icons(games):
     """
     For each game, checks to see if an icon exists the  game by looking
-    for an icon.ico in the game's installation directory
+    for generated icons in the game's installation directory
     """
 
     for appid, game in games.items():
+        for icon_path in local_generated_icon_paths(game, appid):
+            try:
+                games[appid]["icon"] = icon_path.resolve(strict=True)
+                break
+            except Exception:
+                continue
+
+
+def local_generated_icon_paths(game, appid):
+    paths = [get_icon_path(game, appid)]
+    if game["icon_hash"]:
+        paths.append(pathlib.Path(game["location"] / f"{game['icon_hash']}.ico"))
+    return paths
+
+
+def clear_existing_icons(games):
+    removed = 0
+    for appid, game in games.items():
+        for icon_path in local_generated_icon_paths(game, appid):
+            try:
+                icon_path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
+
+        game["icon"] = None
+
+    return removed
+
+
+def get_icon_path(game, appid):
+    return pathlib.Path(game["location"] / f"steam_shortcut_icon_{appid}.ico")
+
+
+def image_to_icon(image):
+    image = ImageOps.exif_transpose(image).convert("RGBA")
+    icon = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+    contained = ImageOps.contain(image, (256, 256), Image.Resampling.LANCZOS)
+    icon.alpha_composite(
+        contained,
+        ((icon.width - contained.width) // 2, (icon.height - contained.height) // 2),
+    )
+    return icon
+
+
+def download_steam_icon(appid, icon_hash):
+    if not icon_hash:
+        return None
+
+    for url_template in STEAM_COMMUNITY_ICON_URLS:
+        url = url_template.format(appid=appid, icon_hash=icon_hash)
         try:
-            icon_path = pathlib.Path(game["location"] / f"{game['icon_hash']}.ico")
-            games[appid]["icon"] = icon_path.resolve(strict=True)
+            response = http.request("GET", url)
         except Exception:
             continue
 
+        if response.status != 200:
+            continue
 
-def get_icons(games):
+        try:
+            with Image.open(io.BytesIO(response.data)) as image:
+                image.load()
+                return image.copy()
+        except Exception:
+            continue
+
+    return None
+
+
+def get_steam_icon(appid, game):
+    icon_hash = game.get("icon_hash")
+    image = download_steam_icon(appid, icon_hash)
+    if image is not None:
+        return image
+
+    raise Exception(f"No Steam icon found for appid {appid}")
+
+
+def get_icons(games, steam_path):
     """
-    This will attempt to download all missing icons from SteamDB and Steam's CDN
+    This will attempt to build missing icons from SteamCMD metadata.
     It might fail, in which case the {appid -> icon} remains None
     """
 
-    for appid, game in filter(lambda g: not g[1]["icon"], games.items()):
-        print(f"  Downloading icon for {appid} ({game['name']})")
-        try:
-            if game["icon_hash"] is None:
-                raise Exception(f"No Icon URL found for {appid} ({game['name']})")
+    missing_games = [(appid, game) for appid, game in games.items() if not game["icon"]]
+    missing_hash_appids = [appid for appid, game in missing_games if not game["icon_hash"]]
+    for appid, icon_hash in steamcmd_clienticon_hashes(
+        missing_hash_appids, steam_path
+    ).items():
+        games[appid]["icon_hash"] = icon_hash
 
-            # Write the ico data to an icon file in the game's install dir
-            icon_url = f"https://steamcdn-a.akamaihd.net/steamcommunity/public/images/apps/{appid}/{game['icon_hash']}.{game['icon_ext']}"
-            icon_path = pathlib.Path(game["location"] / f"{game['icon_hash']}.ico")
-            with http.request("GET", icon_url, preload_content=False) as jpg_data, open(
-                icon_path, "wb+"
-            ) as ico_file:
-                jpg = Image.open(jpg_data)
-                jpg.save(icon_path)
-            jpg_data.release_conn()
+    for appid, game in missing_games:
+        print(f"  Finding icon for {appid} ({game['name']})")
+        try:
+            icon_path = get_icon_path(game, appid)
+            icon = image_to_icon(get_steam_icon(appid, game))
+            icon.save(icon_path, format="ICO", sizes=ICON_SIZES)
 
             # Set the icon location for the game
             games[appid]["icon"] = icon_path
         except KeyboardInterrupt:
             raise
-        except Exception:
+        except Exception as e:
+            print(f"    {e}")
             with open("error_log.txt", "a", encoding="utf-8") as f:
-                f.write(traceback.format_exc())
+                f.write(f"{appid} ({game['name']}): {e}\n")
 
 
 def create_shortcuts(games, create_with_missing, start_menu=False):
