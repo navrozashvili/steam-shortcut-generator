@@ -11,8 +11,10 @@ import io
 import pathlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import time
 import traceback
 import zipfile
 import winreg
@@ -34,6 +36,19 @@ STEAM_COMMUNITY_ICON_URLS = (
     "https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{appid}/{icon_hash}.png",
 )
 STEAMCMD_ZIP_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+# Redistributables Steam installs alongside games. They sit in the libraries
+# looking like games, but nothing launches them and they carry no icon, so
+# they would only ever produce a dead shortcut and a failed icon lookup
+EXCLUDED_APPIDS = {
+    "228980",  # Steamworks Common Redistributables
+    "1007",  # Steamworks SDK Redist
+}
+# How an appinfo.vdf section can be laid out, as (keys live in a string table,
+# bytes of section header before the VDF blob). Newer files pool their keys and
+# carry a second sha1; older ones do neither. Tried in turn rather than matched
+# to a version, so a format we have not seen still reads if it looks like one
+# of these
+APPINFO_LAYOUTS = ((True, 60), (False, 40))
 
 
 def main():
@@ -42,6 +57,7 @@ def main():
     """
 
     force_refresh = "--force-refresh" in sys.argv or "--force" in sys.argv
+    steamcmd_only = "--steamcmd" in sys.argv
 
     # Get path to Steam and libraries
     steam_path = get_steam_path()
@@ -85,7 +101,12 @@ def main():
             try_download = input("Try to download them now? [Y]/n ").lower().strip() != "n"
 
     if try_download:
-        get_icons(games, steam_path)
+        get_icons(
+            games,
+            steam_path,
+            steamcmd_only=steamcmd_only,
+            ask=not (force_refresh or steamcmd_only),
+        )
 
     # Check for any icons that are still missing
     failed = [game["name"] for game in games.values() if not game["icon"]]
@@ -216,6 +237,10 @@ def get_installed_games(libraries):
     # Parse each manifest and build the games dict
     for m in manifests:
         try:
+            appid = m.stem.split("_")[1]
+            if appid in EXCLUDED_APPIDS:
+                continue
+
             with open(m.resolve(), encoding="utf-8") as acf:
                 lines = acf.readlines()
                 name, location = [
@@ -223,7 +248,6 @@ def get_installed_games(libraries):
                 ]
 
                 if name and location:
-                    appid = m.stem.split("_")[1]
                     name, location = [
                         field[0].replace('"', "").split("\t\t")[1]
                         for field in [name, location]
@@ -254,6 +278,158 @@ def get_installed_games(libraries):
 
 def is_icon_hash(value):
     return bool(re.fullmatch(r"[0-9a-fA-F]{40}", value or ""))
+
+
+def read_binary_vdf(data, pos, strings):
+    """
+    Reads one binary VDF object, returning (object, position after it).
+
+    Keys are indexes into the file's string table from appinfo v28 onwards,
+    and inline null terminated strings before that.
+    """
+
+    result = {}
+    while True:
+        node = data[pos]
+        pos += 1
+        if node == 0x08:
+            return result, pos
+
+        if strings is None:
+            end = data.index(b"\x00", pos)
+            key = data[pos:end].decode("utf-8", "replace")
+            pos = end + 1
+        else:
+            (index,) = struct.unpack_from("<I", data, pos)
+            key = strings[index]
+            pos += 4
+
+        if node == 0x00:
+            result[key], pos = read_binary_vdf(data, pos, strings)
+        elif node == 0x01:
+            end = data.index(b"\x00", pos)
+            result[key] = data[pos:end].decode("utf-8", "replace")
+            pos = end + 1
+        elif node in (0x02, 0x03, 0x06):
+            result[key] = struct.unpack_from("<i", data, pos)[0]
+            pos += 4
+        elif node in (0x07, 0x0A):
+            result[key] = struct.unpack_from("<q", data, pos)[0]
+            pos += 8
+        else:
+            raise ValueError(f"unknown VDF node type {node:#x}")
+
+
+def read_appinfo_string_table(data, offset):
+    """
+    Reads the pooled key names an appinfo.vdf section may refer to by index.
+
+    Raises if the offset or count don't fit the file, which is how a layout
+    that doesn't apply to this file gets rejected.
+    """
+
+    (table_offset,) = struct.unpack_from("<q", data, offset)
+    if not 0 < table_offset < len(data) - 4:
+        raise ValueError("string table outside file")
+
+    (count,) = struct.unpack_from("<I", data, table_offset)
+    if count > len(data) - table_offset:
+        raise ValueError("string table longer than file")
+
+    strings = []
+    pos = table_offset + 4
+    for _ in range(count):
+        end = data.index(b"\x00", pos)
+        strings.append(data[pos:end].decode("utf-8", "replace"))
+        pos = end + 1
+
+    return strings
+
+
+def read_appinfo(data, wanted, pooled_keys, header):
+    """
+    Walks appinfo.vdf under one candidate layout.
+
+    The file is a header, then one length prefixed section per app holding a
+    binary VDF blob. Only the sections we were asked about get parsed, the
+    rest are skipped over using that length.
+    """
+
+    strings = read_appinfo_string_table(data, 8) if pooled_keys else None
+    offset = 16 if pooled_keys else 8
+    hashes = {}
+
+    while offset + 8 <= len(data):
+        appid, size = struct.unpack_from("<II", data, offset)
+        if appid == 0:
+            break
+
+        body = offset + 8
+        if size <= header or body + size > len(data):
+            raise ValueError("section runs past end of file")
+        offset = body + size
+
+        if str(appid) not in wanted:
+            continue
+
+        app, _ = read_binary_vdf(data, body + header, strings)
+        # Sections wrap their contents in a single "appinfo" node
+        common = app.get("appinfo", app).get("common", {})
+        icon_hash = common.get("clienticon") if isinstance(common, dict) else None
+        if is_icon_hash(icon_hash):
+            hashes[str(appid)] = icon_hash
+
+    return hashes
+
+
+def parse_appinfo_clienticon_hashes(data, appids):
+    """
+    Pulls clienticon hashes for the given apps out of appinfo.vdf bytes.
+
+    Each known layout is tried until one reads the whole file cleanly, rather
+    than deciding from the version in the header. Valve bumps that version for
+    changes that don't concern us, and a file we can't read costs nothing
+    beyond falling through to SteamCMD.
+    """
+
+    wanted = {str(appid) for appid in appids}
+    if len(data) < 16 or not wanted:
+        return {}
+
+    for pooled_keys, header in APPINFO_LAYOUTS:
+        try:
+            hashes = read_appinfo(data, wanted, pooled_keys, header)
+        except Exception:
+            continue
+        if hashes:
+            return hashes
+
+    return {}
+
+
+def appinfo_clienticon_hashes(appids, steam_path):
+    """
+    Reads icon hashes straight out of Steam's own metadata cache.
+
+    Steam keeps the same app info SteamCMD would fetch in appcache/appinfo.vdf,
+    so for anything already known to the local client this costs a file read
+    rather than a download.
+    """
+
+    appids = [str(appid) for appid in appids]
+    if not appids:
+        return {}
+
+    appinfo_path = steam_path / "appcache" / "appinfo.vdf"
+    try:
+        data = appinfo_path.read_bytes()
+    except OSError:
+        return {}
+
+    try:
+        return parse_appinfo_clienticon_hashes(data, appids)
+    except Exception:
+        return {}
 
 
 def find_steamcmd(steam_path):
@@ -305,22 +481,100 @@ def download_steamcmd():
 
 
 def parse_steamcmd_clienticon_hashes(output, appids):
-    hashes = {}
-    for appid in appids:
-        match = re.search(
-            rf'"{re.escape(str(appid))}"\s*\{{.*?"clienticon"\s+"([0-9a-fA-F]{{40}})"',
-            output,
-            re.DOTALL,
-        )
-        if match:
-            hashes[str(appid)] = match.group(1)
+    """
+    Pulls each app's clienticon out of `app_info_print` output.
 
-    if len(appids) == 1 and not hashes:
-        match = re.search(r'"clienticon"\s+"([0-9a-fA-F]{40})"', output)
+    SteamCMD writes one block per app, each opening with the appid quoted on
+    its own line, so split on that and search within a single block. Scanning
+    the whole output for an appid followed by a clienticon runs past the end of
+    its block, handing an app that has no icon of its own the next app's hash.
+    """
+
+    wanted = {str(appid) for appid in appids}
+    hashes = {}
+
+    blocks = re.split(r'^"(\d+)"$', output, flags=re.MULTILINE)
+    for appid, block in zip(blocks[1::2], blocks[2::2]):
+        if appid not in wanted:
+            continue
+        match = re.search(r'"clienticon"\s+"([0-9a-fA-F]{40})"', block)
         if match:
-            hashes[str(appids[0])] = match.group(1)
+            hashes[appid] = match.group(1)
 
     return hashes
+
+
+def steamcmd_needs_setup(steamcmd):
+    """
+    A freshly unzipped steamcmd.exe is only a bootstrapper. It unpacks a
+    `package` folder alongside itself the first time it self-updates.
+    """
+
+    return not (pathlib.Path(steamcmd).resolve().parent / "package").is_dir()
+
+
+def prepare_steamcmd(steamcmd):
+    """
+    Lets SteamCMD self-update before we capture anything from it.
+
+    SteamCMD only reports progress when it has a console to write to, so this
+    has to run without redirection, and that means a run of its own. It happens
+    once, after which `package` exists and we skip straight to the app info.
+
+    Expect a lot of output. SteamCMD bootstraps in two passes, updating itself
+    to the full client and then to the current build, logging a line per
+    package each time. That is one setup, not a loop.
+    """
+
+    print("    Setting up SteamCMD, this only happens once...", flush=True)
+    try:
+        subprocess.run([steamcmd, "+quit"], timeout=600)
+    except Exception:
+        pass
+
+    print("    SteamCMD ready", flush=True)
+
+
+def run_steamcmd(command, expected):
+    """
+    Runs SteamCMD, counting off each app's metadata as it arrives.
+
+    SteamCMD prints an `AppID : <id>` header before each block it dumps, which
+    is the only progress going on the first run, where every app is fetched
+    individually and the whole thing takes half a minute. The blocks after
+    those headers are about a megabyte of VDF, so they go to the returned
+    output rather than the terminal.
+
+    Returns the combined output.
+    """
+
+    lines = []
+    read = 0
+    deadline = time.monotonic() + 300
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    with process:
+        for line in process.stdout:
+            lines.append(line)
+            if line.startswith("AppID : "):
+                read += 1
+                print(f"\r    Read metadata for {read} of {expected} app(s)", end="", flush=True)
+            if time.monotonic() > deadline:
+                process.kill()
+                break
+
+    if read:
+        print()
+
+    return "".join(lines)
 
 
 def steamcmd_clienticon_hashes(appids, steam_path):
@@ -331,6 +585,9 @@ def steamcmd_clienticon_hashes(appids, steam_path):
     steamcmd = find_steamcmd(steam_path) or download_steamcmd()
     if steamcmd is None:
         return {}
+
+    if steamcmd_needs_setup(steamcmd):
+        prepare_steamcmd(steamcmd)
 
     print(f"    Fetching clienticon hashes from SteamCMD for {len(appids)} app(s)...")
     command = [
@@ -345,18 +602,10 @@ def steamcmd_clienticon_hashes(appids, steam_path):
     command.append("+quit")
 
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=300,
-        )
+        output = run_steamcmd(command, len(appids))
     except Exception:
         return {}
 
-    output = result.stdout + result.stderr
     return parse_steamcmd_clienticon_hashes(output, appids)
 
 
@@ -414,6 +663,30 @@ def image_to_icon(image):
     return icon
 
 
+def open_best_frame(data):
+    """
+    Opens image bytes, picking the richest frame of a multi-frame .ico.
+
+    Pillow sorts .ico entries by ascending colour depth and hands back the
+    first entry matching a size, so an icon shipping a 1-bit monochrome frame
+    alongside a full colour frame of the same dimensions (e.g. appid 534380)
+    decodes as a flat block of white. Choose the largest, deepest frame here
+    instead of taking Pillow's default.
+    """
+
+    with Image.open(io.BytesIO(data)) as image:
+        if image.format == "ICO":
+            entries = image.ico.entry
+            best = max(
+                range(len(entries)),
+                key=lambda i: (entries[i].square, entries[i].bpp),
+            )
+            image = image.ico.frame(best)
+
+        image.load()
+        return image.copy()
+
+
 def download_steam_icon(appid, icon_hash):
     if not icon_hash:
         return None
@@ -429,9 +702,7 @@ def download_steam_icon(appid, icon_hash):
             continue
 
         try:
-            with Image.open(io.BytesIO(response.data)) as image:
-                image.load()
-                return image.copy()
+            return open_best_frame(response.data)
         except Exception:
             continue
 
@@ -447,18 +718,60 @@ def get_steam_icon(appid, game):
     raise Exception(f"No Steam icon found for appid {appid}")
 
 
-def get_icons(games, steam_path):
+def report_unresolved(unresolved):
+    print(
+        f"\n  Steam's local metadata has no icon for {len(unresolved)} "
+        f"game{'s' if len(unresolved) != 1 else ''}:"
+    )
+    for appid, game in unresolved:
+        print(f"    {game['name']} ({appid})")
+
+
+def confirm_steamcmd_lookup(unresolved):
+    report_unresolved(unresolved)
+    print("  SteamCMD can look these up. Its first run downloads about 70MB and")
+    print("  takes around 45 seconds, later runs a few seconds.")
+
+    return input("  Ask SteamCMD? y/[N] ").lower().strip() == "y"
+
+
+def get_icons(games, steam_path, steamcmd_only=False, ask=True):
     """
-    This will attempt to build missing icons from SteamCMD metadata.
+    This will attempt to build missing icons from Steam's app metadata,
+    falling back to SteamCMD for anything the local cache doesn't know.
     It might fail, in which case the {appid -> icon} remains None
     """
 
     missing_games = [(appid, game) for appid, game in games.items() if not game["icon"]]
     missing_hash_appids = [appid for appid, game in missing_games if not game["icon_hash"]]
-    for appid, icon_hash in steamcmd_clienticon_hashes(
-        missing_hash_appids, steam_path
-    ).items():
-        games[appid]["icon_hash"] = icon_hash
+
+    if steamcmd_only:
+        for appid, icon_hash in steamcmd_clienticon_hashes(
+            missing_hash_appids, steam_path
+        ).items():
+            games[appid]["icon_hash"] = icon_hash
+        unresolved = []
+    else:
+        for appid, icon_hash in appinfo_clienticon_hashes(
+            missing_hash_appids, steam_path
+        ).items():
+            games[appid]["icon_hash"] = icon_hash
+
+        unresolved = [
+            (appid, game) for appid, game in missing_games if not game["icon_hash"]
+        ]
+
+    if unresolved and not ask:
+        # Nobody to ask, so say what was missed and how to go and get it
+        report_unresolved(unresolved)
+        print("  Run again with --steamcmd to look these up.")
+        unresolved = []
+
+    if unresolved and confirm_steamcmd_lookup(unresolved):
+        for appid, icon_hash in steamcmd_clienticon_hashes(
+            [appid for appid, _ in unresolved], steam_path
+        ).items():
+            games[appid]["icon_hash"] = icon_hash
 
     for appid, game in missing_games:
         print(f"  Finding icon for {appid} ({game['name']})")

@@ -35,16 +35,30 @@ To force icon regeneration without the refresh prompt, run:
 uv run --python 3.13 .\steam_shortcuts.py --force-refresh
 ```
 
+Icon metadata normally comes from Steam's own cache, and this flag never falls
+back to SteamCMD, so it won't stop to ask or start a download. Anything the
+cache doesn't cover is listed at the end instead.
+
+To skip the cache and take every icon hash from SteamCMD, run:
+
+```powershell
+uv run --python 3.13 .\steam_shortcuts.py --steamcmd
+```
+
+SteamCMD is downloaded if it isn't already present. Expect its first run to
+fetch about 70MB and take around 45 seconds.
+
 ## What does it do?
 
 1. Checks your registry for the Steam install folder
 2. Reads `steamapps/libraryfolders.vdf` to find out where all your Steam libraries are located
-3. For each library, parse all the `appmanifest_xxx.acf` files for game names and install locations, where xxx is the appid of an installed game
+3. For each library, parse all the `appmanifest_xxx.acf` files for game names and install locations, where xxx is the appid of an installed game, skipping Steam's own redistributable packages since nothing launches them
 4. For each game, check if a generated icon already exists in the game's installation folder
-5. Uses SteamCMD to fetch each missing game's `clienticon` metadata
-6. Downloads the matching icon from Steam's CDN and writes a multi-size `.ico` file in the game's installation folder
-7. For each game, now create the URL shortcuts to `steam://rungameid/{appid}`, set the icon if it exists, or blank if the user asks for icon-less shortcuts
-8. Done! No tidying up is done since the icons are kept in the game folders for use by each shortcut. I guess things might break if you uninstall the game, but they're just shortcuts :)
+5. Reads each missing game's `clienticon` metadata out of Steam's own `appcache/appinfo.vdf`
+6. If any game isn't in that cache, lists them and offers to ask SteamCMD instead, downloading it if needed
+7. Downloads the matching icon from Steam's CDN and writes a multi-size `.ico` file in the game's installation folder
+8. For each game, now create the URL shortcuts to `steam://rungameid/{appid}`, set the icon if it exists, or blank if the user asks for icon-less shortcuts
+9. Done! No tidying up is done since the icons are kept in the game folders for use by each shortcut. I guess things might break if you uninstall the game, but they're just shortcuts :)
 
 ## Warnings
 
